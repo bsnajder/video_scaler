@@ -112,6 +112,7 @@ osvvm_lib.add_source_file(osvvm_path / "ReportPkg.vhd")
 # Create a library named 'tb_lib'
 tb_lib = vu.add_library("tb_lib")
 tb_lib.add_source_files(os.path.join(hdl_path, "tb/tb_scale.vhd"))
+tb_lib.add_source_files(os.path.join(hdl_path, "tb/tb_scale_reg.vhd"))
 
 # Include VUnit's AXI4-Lite Master
 vu.add_verification_components()

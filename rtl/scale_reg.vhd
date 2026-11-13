@@ -110,31 +110,29 @@ architecture rtl of scale_reg is
     signal decode_waddr            : unsigned(REG_ARR_DEC_RANGE);
     signal decode_raddr            : unsigned(REG_ARR_DEC_RANGE);
 
-    signal awready_i                : std_logic := '1';
-    signal wr_op_active             : std_logic := '0';
-    
-    signal wready_i                 : std_logic := '0';
+    signal awready_i                : std_logic;
+    signal wready_i                 : std_logic;
     signal bvalid_i                 : std_logic := '0';
-    signal arready_i                : std_logic := '0';
+    signal arready_i                : std_logic;
     signal rvalid_i                 : std_logic := '0';
 
-    signal wstrb_h                  : unsigned(AXI_DWIDTH/8-1 downto 0);
-    signal wdata_h                  : unsigned(AXI_DWIDTH-1 downto 0); 
-    
-    signal arready_d                : std_logic := '0';
-    signal arvalid_d                : std_logic := '0';    
+    signal aw_done                  : std_logic := '0'; --write address accepted, waiting for write to complete
+    signal w_done                   : std_logic := '0'; --write data accepted, waiting for write to complete
 
-    signal read_busy                : std_logic;    
+    signal wstrb_h                  : unsigned(AXI_DWIDTH/8-1 downto 0);
+    signal wdata_h                  : unsigned(AXI_DWIDTH-1 downto 0);
 
     signal irq_flags                : std_logic_vector(0 downto 0);
 
-    type t_wr_fsm is 
-        (
-            WR_READY_s,
-            WR_RUN_s
-        );
-    signal wr_fsm_cs : t_wr_fsm;
-    signal wr_fsm_ns : t_wr_fsm;
+    -- one-hot register select for a decoded address; all zeros for unmapped addresses
+    function addr_to_sel(addr : unsigned) return unsigned is
+        variable sel : unsigned(REG_ARR_SIZE-1 downto 0) := (others => '0');
+    begin
+        if to_integer(addr) < REG_ARR_SIZE then
+            sel(to_integer(addr)) := '1';
+        end if;
+        return sel;
+    end addr_to_sel;
 
     function get_reg_data(reg_arr_in: in reg_arr_t; reg_name: string) return unsigned is
         variable tmp_data   : unsigned(AXI_DWIDTH-1 downto 0);
@@ -193,193 +191,91 @@ begin
     -----------------------------------------
     --write channel
     -----------------------------------------
+    -- AW and W are accepted independently and in any order (AXI allows either
+    -- channel to arrive first). The register write and BVALID happen once both
+    -- have been accepted. Neither channel accepts a new beat until the pending
+    -- response has been taken, so decode_waddr/wdata_h/wstrb_h stay stable
+    -- while reg_wsel is applied.
+    awready_i <= not aw_done and not bvalid_i;
+    wready_i  <= not w_done  and not bvalid_i;
+
     process (aclk)
     begin
         if rising_edge(aclk) then
+            reg_wsel <= (others => '0');
             if areset = '1' then
-                wr_fsm_cs <= WR_READY_s;
-            else
-                wr_fsm_cs <= wr_fsm_ns;
-            end if;
-        end if;
-    end process;
-
-    process (wr_fsm_cs, awvalid, wvalid, bready, bvalid_i)
-    begin
-        case (wr_fsm_cs) is
-            when WR_READY_s =>
-                if (awvalid = '1') then --this assumes that awready_i = '1'
-                    wr_fsm_ns <= WR_RUN_s;
-                else
-                    wr_fsm_ns <= WR_READY_s;
-                end if;
-            when WR_RUN_s =>
-                if (bready = '1' and bvalid_i = '1') then
-                    wr_fsm_ns <= WR_READY_s;
-                else
-                    wr_fsm_ns <= WR_RUN_s;
-                end if;
-            when others =>
-                wr_fsm_ns <= WR_READY_s;
-        end case;
-    end process;
-
-    awready_i <= '1' when wr_fsm_cs = WR_READY_s else '0';
-    
-    process (aclk)
-    begin
-        if rising_edge(aclk) then
-            if areset = '1' then
-                wr_op_active <= '0';
-                reg_wsel <= (others => '0');
-            else
-                --we do not pipeline the write operation
-                --we have two options, wvalid is asserted when awvalid is asserted, or wvalid will get asserted at later stage
-                reg_wsel <= (others => '0');
-                if wr_fsm_cs = WR_READY_s and wr_fsm_ns = WR_RUN_s then --address is goind to be acked
-                    if (wvalid = '1') then
-                        reg_wsel(to_integer(unsigned(RESOLVE(awaddr(decode_waddr'range))))) <= '1'; --drive register select bit in the vector   
-                        decode_waddr <= unsigned(RESOLVE(awaddr(decode_waddr'range))); --once master has asserted address (awvalid is high), it should remain fixed; we can latch it here, and indicated that we have latched it
-                    end if;
-                elsif wr_fsm_cs = WR_RUN_s and wvalid = '1' then
-                    reg_wsel(to_integer(decode_waddr)) <= '1'; --drive register select bit in the vector
-                end if;
-
-            end if;                
-        end if;
-    end process;   
-
-    process (aclk)
-    begin
-        if rising_edge(aclk) then
-            if areset = '1' then
-                wready_i <= '0';
-            else
-                if (wvalid = '1' and wready_i = '1') then
-                    wready_i <= '0';
-                elsif (wr_fsm_cs = WR_RUN_s and wr_fsm_ns /= WR_RUN_s) or (wr_fsm_cs = WR_READY_s) then
-                    wready_i <= '1';
-                end if;
-            end if;
-        end if;
-    end process;  
-
-    process (aclk)
-    begin
-        if rising_edge(aclk) then
-            if (wvalid = '1' and wready_i = '1') then --we will assert wready signal, when we have active operation and there is valid data on the bus
-                wstrb_h <= unsigned(wstrb); --latch the strobe signal
-                wdata_h <= unsigned(wdata); --latch the data
-            end if;
-        end if;
-    end process;      
-
-    process (aclk)
-    begin
-        if rising_edge(aclk) then
-            if areset = '1' then
+                aw_done  <= '0';
+                w_done   <= '0';
                 bvalid_i <= '0';
             else
-                if (bvalid_i = '1' and bready = '1') then --assert bvalid signal when wready is high (data will be latched)
+                if (awvalid = '1' and awready_i = '1') then
+                    decode_waddr <= unsigned(RESOLVE(awaddr(decode_waddr'range)));
+                    aw_done      <= '1';
+                end if;
+
+                if (wvalid = '1' and wready_i = '1') then
+                    wstrb_h <= unsigned(wstrb);
+                    wdata_h <= unsigned(wdata);
+                    w_done  <= '1';
+                end if;
+
+                if (aw_done = '1' and w_done = '1') then
+                    reg_wsel <= addr_to_sel(decode_waddr); --writes to unmapped addresses are ignored
+                    aw_done  <= '0';
+                    w_done   <= '0';
+                    bvalid_i <= '1';
+                elsif (bvalid_i = '1' and bready = '1') then
                     bvalid_i <= '0';
-                elsif (wr_fsm_cs = WR_READY_s and wr_fsm_ns = WR_RUN_s and wvalid = '1' and wready_i = '1') then
-                    bvalid_i <= '1';
-                elsif (wr_fsm_cs = WR_RUN_s and wvalid = '1' and wready_i = '1') then
-                    bvalid_i <= '1';
                 end if;
-
             end if;
         end if;
-    end process;  
+    end process;
 
-   -----------------------------------------
+    -----------------------------------------
     --read channel
-    -----------------------------------------    
+    -----------------------------------------
+    -- Register data is captured on the AR handshake and held until the R
+    -- handshake, so RDATA is stable while RVALID is high. A new address is
+    -- not accepted while a read response is outstanding.
+    arready_i <= not rvalid_i;
 
     process (aclk)
+        variable raddr : unsigned(REG_ARR_DEC_RANGE);
     begin
         if rising_edge(aclk) then
+            reg_rsel <= (others => '0');
             if areset = '1' then
-                arready_i <= '0';
-                arready_d <= '0';
-                arvalid_d <= '0';
-            else
-                if (arvalid = '1' and read_busy = '0' and arready_i = '0') then
-                    arready_i <= '1';
-                elsif (arready_i = '1' and arvalid = '1') then --deassrert arready signal, when address has been latched
-                    arready_i <= '0';
-                end if;
-
-                arready_d <= arready_i;
-                arvalid_d <= arvalid;
-            end if;
-        end if;
-    end process;   
-    
-    process (aclk)
-    begin
-        if rising_edge(aclk) then
-            if areset = '1' then
+                rvalid_i     <= '0';
                 decode_raddr <= (others => '0');
             else
-                if (arvalid = '1' and arready_i = '0') then
-                    decode_raddr <= unsigned(RESOLVE(araddr(decode_raddr'range)));                
-                end if;
-            end if;
-        end if;
-    end process;    
-    
-    process (aclk)
-    
-    begin
-        if rising_edge(aclk) then
-            if ((arready_i = '1' and arvalid = '1')) then
-                reg_rsel(to_integer(decode_raddr)) <= '1';
-            else
-                reg_rsel <= (others => '0');
-            end if;
-        end if;
-    end process;         
-    
-    process (aclk)
-    begin
-        if rising_edge(aclk) then
-            if (areset = '1') then
-                rvalid_i  <= '0';
-            else
-                if (read_busy = '1') then
-                    rvalid_i <= '1';
-                end if;
-                if (rvalid_i = '1' and rready = '1') then
+                if (arvalid = '1' and arready_i = '1') then
+                    raddr        := unsigned(RESOLVE(araddr(decode_raddr'range)));
+                    decode_raddr <= raddr;
+                    reg_rsel     <= addr_to_sel(raddr);
+                    rvalid_i     <= '1';
+                elsif (rvalid_i = '1' and rready = '1') then
                     rvalid_i <= '0';
                 end if;
             end if;
         end if;
-    end process;    
-    
-   process (aclk)
-    begin
-        if rising_edge(aclk) then
-            if areset = '1' then
-                read_busy       <= '0';
-            else
-                if (arready_i = '0' and arvalid = '1' and read_busy = '0' ) then
-                    read_busy <= '1';
-                elsif (rready = '1' and rvalid_i = '1') then
-                    read_busy <= '0';
-                end if;
-            end if;
-        end if;
-    end process;      
-    
+    end process;
+
     AXI_D32_g: if AXI_DWIDTH = 32 generate
         process (aclk)
+            variable raddr : unsigned(REG_ARR_DEC_RANGE);
         begin
             if rising_edge(aclk) then
-                rdata <= std_logic_vector(reg_arr(to_integer(decode_raddr)));   
+                if (arvalid = '1' and arready_i = '1') then
+                    raddr := unsigned(RESOLVE(araddr(decode_raddr'range)));
+                    if to_integer(raddr) < REG_ARR_SIZE then
+                        rdata <= std_logic_vector(reg_arr(to_integer(raddr)));
+                    else
+                        rdata <= (others => '0'); --unmapped address
+                    end if;
+                end if;
             end if;
         end process;
-    end generate;           
+    end generate;
 
     ---------------------------------------------
     -- memory logic
@@ -406,7 +302,9 @@ begin
 
                             if reg_wsel(get_reg_index("REG_IRQ_FLAG")) = '1' then --clear by writing '1'
                                 for iflag in irq_flags'range loop
-                                    if temp_reg(iflag) = '1' then
+                                    --only bits actually written as '1' clear a flag; temp_reg would also
+                                    --contain the current (set) flag value for bytes not enabled by wstrb
+                                    if wstrb_h(iflag/8) = '1' and wdata_h(iflag) = '1' then
                                         reg_arr(get_reg_index("REG_IRQ_FLAG"))(iflag) <= '0';
                                     end if;                                
                                 end loop;  
